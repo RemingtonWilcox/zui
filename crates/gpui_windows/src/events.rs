@@ -420,7 +420,13 @@ impl WindowsWindowInner {
         button: MouseButton,
         lparam: LPARAM,
     ) -> Option<isize> {
-        unsafe { SetCapture(handle) };
+        unsafe {
+            SetCapture(handle);
+            // Clicking GPUI content takes keyboard focus back from native children.
+            if IsChild(handle, GetFocus()).as_bool() {
+                let _ = SetFocus(Some(handle));
+            }
+        }
 
         let Some(mut func) = self.state.callbacks.input.take() else {
             return Some(1);

@@ -49,6 +49,9 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
+    overlay: Option<SceneOverlay>,
+    /// Base frame sampled by overlay blurs; the overlay plane alone is empty.
+    backdrop_source: Option<ID3D11Texture2D>,
     font_info: &'static FontInfo,
 
     width: u32,
@@ -127,6 +130,15 @@ struct DirectComposition {
     comp_visual: IDCompositionVisual,
 }
 
+/// A second swap chain composed above child windows. The base visual moves to
+/// a non-topmost target so native children (e.g. WebView2) sit between them.
+struct SceneOverlay {
+    resources: DirectXResources,
+    _base_target: IDCompositionTarget,
+    _visual: IDCompositionVisual,
+    visible: bool,
+}
+
 impl DirectXRendererDevices {
     pub(crate) fn new(
         directx_devices: &DirectXDevices,
@@ -196,6 +208,8 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
+            overlay: None,
+            backdrop_source: None,
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
@@ -262,6 +276,7 @@ impl DirectXRenderer {
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
         let disable_direct_composition = self.direct_composition.is_none();
+        let overlay = self.overlay.is_some();
 
         unsafe {
             #[cfg(debug_assertions)]
@@ -282,6 +297,7 @@ impl DirectXRenderer {
                     .log_err();
             }
 
+            self.overlay.take();
             self.direct_composition.take();
             self.devices.take();
         }
@@ -324,7 +340,104 @@ impl DirectXRenderer {
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
         self.skip_draws = true;
+        // Native child windows stay beneath the recreated overlay plane.
+        if overlay {
+            self.enable_scene_overlay()?;
+        }
         Ok(())
+    }
+
+    pub(crate) fn enable_scene_overlay(&mut self) -> Result<()> {
+        if self.overlay.is_some() {
+            return Ok(());
+        }
+        let composition = self
+            .direct_composition
+            .as_ref()
+            .context("Scene overlays require DirectComposition")?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = DirectXResources::new(devices, self.width, self.height, self.hwnd, false)?;
+        unsafe {
+            let visual = composition.comp_device.CreateVisual()?;
+            visual.SetContent(&resources.swap_chain)?;
+            // Topmost content draws over child windows; the base scene moves
+            // to a target that child windows cover.
+            composition.comp_target.SetRoot(&visual)?;
+            let base_target = composition
+                .comp_device
+                .CreateTargetForHwnd(self.hwnd, false)?;
+            base_target.SetRoot(&composition.comp_visual)?;
+            composition.comp_device.Commit()?;
+            self.overlay = Some(SceneOverlay {
+                resources,
+                _base_target: base_target,
+                _visual: visual,
+                visible: true,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_scene_overlay(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    pub(crate) fn draw_layered(
+        &mut self,
+        scene: &Scene,
+        overlay_start: usize,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<()> {
+        if self.overlay.is_none() {
+            return self.draw(scene, background_appearance);
+        }
+        if self.skip_draws {
+            return Ok(());
+        }
+        if self.draw_layered_scenes(scene, overlay_start, background_appearance)? {
+            self.with_overlay_resources(|renderer| renderer.present())?;
+        }
+        self.present()
+    }
+
+    /// Draws the base and overlay planes without presenting them. Returns
+    /// whether the overlay plane changed.
+    fn draw_layered_scenes(
+        &mut self,
+        scene: &Scene,
+        overlay_start: usize,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<bool> {
+        let split = overlay_start.min(scene.len());
+        let mut base = Scene::default();
+        base.replay(0..split, scene);
+        base.finish();
+        let mut top = Scene::default();
+        top.replay(split..scene.len(), scene);
+        top.finish();
+        self.draw_scene(&base, background_appearance)?;
+        let overlay = self.overlay.as_mut().context("scene overlay missing")?;
+        let visible = !top.is_empty();
+        let changed = visible || overlay.visible;
+        overlay.visible = visible;
+        if changed {
+            self.backdrop_source = self.resources.as_ref().unwrap().render_target.clone();
+            let result = self.with_overlay_resources(|renderer| {
+                renderer.draw_scene(&top, WindowBackgroundAppearance::Transparent)
+            });
+            self.backdrop_source = None;
+            result?;
+        }
+        Ok(changed)
+    }
+
+    fn with_overlay_resources<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let mut overlay = self.overlay.take().unwrap();
+        std::mem::swap(self.resources.as_mut().unwrap(), &mut overlay.resources);
+        let result = f(self);
+        std::mem::swap(self.resources.as_mut().unwrap(), &mut overlay.resources);
+        self.overlay = Some(overlay);
+        result
     }
 
     pub(crate) fn draw(
@@ -438,39 +551,21 @@ impl DirectXRenderer {
         self.width = width;
         self.height = height;
 
-        // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
-        unsafe { devices.device_context.OMSetRenderTargets(None, None) };
         let resources = self.resources.as_mut().context("resources missing")?;
-        resources.backdrop = None;
-        resources.render_target.take();
-        resources.render_target_view.take();
-
-        // Resizing the swap chain requires a call to the underlying DXGI adapter, which can return the device removed error.
-        // The app might have moved to a monitor that's attached to a different graphics device.
-        // When a graphics device is removed or reset, the desktop resolution often changes, resulting in a window size change.
-        // But here we just return the error, because we are handling device lost scenarios elsewhere.
-        unsafe {
-            resources
-                .swap_chain
-                .ResizeBuffers(
-                    BUFFER_COUNT as u32,
-                    width,
-                    height,
-                    RENDER_TARGET_FORMAT,
-                    DXGI_SWAP_CHAIN_FLAG(0),
+        resize_resources(devices, resources, width, height)?;
+        if let Some(overlay) = &mut self.overlay {
+            resize_resources(devices, &mut overlay.resources, width, height)?;
+            // Leave the main render target bound for the next draw.
+            unsafe {
+                devices.device_context.OMSetRenderTargets(
+                    Some(slice::from_ref(
+                        &self.resources.as_ref().unwrap().render_target_view,
+                    )),
+                    None,
                 )
-                .context("Failed to resize swap chain")?;
+            };
         }
-
-        resources.recreate_resources(devices, width, height)?;
-
-        unsafe {
-            devices
-                .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
-        }
-
         Ok(())
     }
 
@@ -827,6 +922,45 @@ impl DirectXRenderer {
     pub(crate) fn mark_drawable(&mut self) {
         self.skip_draws = false;
     }
+}
+
+fn resize_resources(
+    devices: &DirectXRendererDevices,
+    resources: &mut DirectXResources,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    // Clear the render target before resizing
+    unsafe { devices.device_context.OMSetRenderTargets(None, None) };
+    resources.backdrop = None;
+    resources.render_target.take();
+    resources.render_target_view.take();
+
+    // Resizing the swap chain requires a call to the underlying DXGI adapter, which can return the device removed error.
+    // The app might have moved to a monitor that's attached to a different graphics device.
+    // When a graphics device is removed or reset, the desktop resolution often changes, resulting in a window size change.
+    // But here we just return the error, because we are handling device lost scenarios elsewhere.
+    unsafe {
+        resources
+            .swap_chain
+            .ResizeBuffers(
+                BUFFER_COUNT as u32,
+                width,
+                height,
+                RENDER_TARGET_FORMAT,
+                DXGI_SWAP_CHAIN_FLAG(0),
+            )
+            .context("Failed to resize swap chain")?;
+    }
+
+    resources.recreate_resources(devices, width, height)?;
+
+    unsafe {
+        devices
+            .device_context
+            .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+    }
+    Ok(())
 }
 
 impl DirectXResources {

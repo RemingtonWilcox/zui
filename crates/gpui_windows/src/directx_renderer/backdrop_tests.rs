@@ -56,6 +56,10 @@ fn warp_devices() -> Result<DirectXDevices> {
 }
 
 fn warp_renderer() -> Result<(DirectXRenderer, TestWindow)> {
+    warp_renderer_with(true)
+}
+
+fn warp_renderer_with(disable_direct_composition: bool) -> Result<(DirectXRenderer, TestWindow)> {
     unsafe {
         let devices = warp_devices()?;
         // A hidden built-in window class avoids a message loop and custom WndProc.
@@ -73,7 +77,7 @@ fn warp_renderer() -> Result<(DirectXRenderer, TestWindow)> {
             None,
             None,
         )?);
-        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, disable_direct_composition)?;
         renderer.resize(size(DevicePixels(64), DevicePixels(64)))?;
         Ok((renderer, window))
     }
@@ -995,5 +999,53 @@ fn warp_invalid_geometry_allocates_nothing_and_idle_cache_expires() -> Result<()
         renderer.draw_scene(&scene, WindowBackgroundAppearance::Opaque)?;
     }
     assert!(renderer.resources.as_ref().unwrap().backdrop.is_none());
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
+fn warp_scene_overlay_blurs_the_base_frame_and_survives_device_loss() -> Result<()> {
+    let (mut reference, _reference_window) = warp_renderer()?;
+    let mut expected = checkerboard();
+    expected.backdrop_blurs.push(blur(1));
+    reference.draw_scene(&expected, WindowBackgroundAppearance::Opaque)?;
+    let expected = pixels(&reference)?;
+
+    // The overlay plane requires DirectComposition.
+    let (mut renderer, _window) = warp_renderer_with(false)?;
+    renderer.enable_scene_overlay()?;
+    let mut scene = Scene::default();
+    for quad in checkerboard().quads {
+        scene.insert_primitive(quad);
+    }
+    let overlay_start = scene.len();
+    scene.insert_backdrop_blur(blur(0));
+    for recovered in [false, true] {
+        assert!(renderer.draw_layered_scenes(
+            &scene,
+            overlay_start,
+            WindowBackgroundAppearance::Opaque
+        )?);
+        let overlay = renderer.with_overlay_resources(|renderer| pixels(renderer))?;
+        // The overlay plane holds only the blur, sampled from the base frame
+        // beneath it rather than from its own transparent target.
+        let covered = overlay.iter().filter(|pixel| pixel[3] != 0).count();
+        assert!(
+            covered > 1500,
+            "blur missing from overlay (recovered: {recovered})"
+        );
+        for (actual, expected) in overlay.iter().zip(&expected) {
+            if actual[3] != 0 {
+                assert_pixels(&[*actual], &[*expected], 1);
+            }
+        }
+        if !recovered {
+            renderer.handle_device_lost(&warp_devices()?)?;
+            assert!(
+                renderer.has_scene_overlay(),
+                "device loss dropped the overlay"
+            );
+            renderer.mark_drawable();
+        }
+    }
     Ok(())
 }

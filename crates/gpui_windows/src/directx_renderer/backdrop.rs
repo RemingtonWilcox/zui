@@ -306,9 +306,9 @@ impl DirectXRenderer {
                 0,
                 0,
                 0,
-                resources
-                    .render_target
+                self.backdrop_source
                     .as_ref()
+                    .or(resources.render_target.as_ref())
                     .context("missing render target")?,
                 0,
                 Some(&D3D11_BOX {
